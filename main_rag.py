@@ -1,4 +1,27 @@
-import numpy as np
+async def _get_neighboring_chunks(self, payload: Dict, num_neighbors: int = 3) -> List[Dict]:
+        """Get neighboring chunks based on file and position"""
+        try:
+            source_file = payload.get("source_file_name")
+            page_number = payload.get("page_number")
+            chunk_index = payload.get("chunk_index")
+            
+            if not all([source_file, chunk_index is not None]):
+                return []
+            
+            # For files without page numbers, use chunk_index based filtering
+            if page_number is None:
+                # Simple approach: get chunks with similar indices from same file
+                return await self._get_neighbors_by_index(source_file, chunk_index, num_neighbors)
+            
+            # Create filter for same document and page
+            doc_filter = Filter(must=[
+                FieldCondition(key="source_file_name", match=MatchValue(value=source_file)),
+                FieldCondition(key="page_number", match=MatchValue(value=page_number))
+            ])
+            
+            # Get neighboring chunks
+            neighbors = []
+            min_index = max(0, chunk_import numpy as np
 from typing import List, Dict, Optional, Tuple
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, SearchRequest
@@ -161,68 +184,106 @@ class VectorRAGService:
                 all_chunks.append(chunk)
                 seen_chunk_ids.add(chunk_id)
             
-            # Get neighbors
-            neighbors = await self._get_neighboring_chunks(chunk["payload"])
-            for neighbor in neighbors:
-                neighbor_id = self._get_chunk_id(neighbor["payload"])
-                if neighbor_id not in seen_chunk_ids:
-                    all_chunks.append(neighbor)
-                    seen_chunk_ids.add(neighbor_id)
+            # Try to get neighbors, but continue if it fails
+            try:
+                neighbors = await self._get_neighboring_chunks(chunk["payload"])
+                for neighbor in neighbors:
+                    neighbor_id = self._get_chunk_id(neighbor["payload"])
+                    if neighbor_id not in seen_chunk_ids:
+                        all_chunks.append(neighbor)
+                        seen_chunk_ids.add(neighbor_id)
+            except Exception as e:
+                # Skip neighboring chunks if there's an index issue
+                print(f"Skipping neighboring chunks due to: {e}")
+                continue
         
         return all_chunks
     
     async def _get_neighboring_chunks(self, payload: Dict, num_neighbors: int = 3) -> List[Dict]:
-        """Get neighboring chunks based on file and position"""
+        """Get neighboring chunks using sliding window with minimum chunk count"""
         try:
             source_file = payload.get("source_file_name")
-            page_number = payload.get("page_number")
             chunk_index = payload.get("chunk_index")
+            total_chunks = payload.get("total_chunks")
+            document_id = payload.get("document_id")
             
-            if not all([source_file, page_number is not None, chunk_index is not None]):
+            if not all([source_file, chunk_index is not None, total_chunks is not None]):
                 return []
             
-            # Create filter for same document and page
-            doc_filter = Filter(must=[
-                FieldCondition(key="source_file_name", match=MatchValue(value=source_file)),
-                FieldCondition(key="page_number", match=MatchValue(value=page_number))
-            ])
+            # Calculate sliding window to get minimum number of chunks
+            # We want (num_neighbors * 2 + 1) total chunks with current chunk ideally in center
+            window_size = num_neighbors * 2 + 1  # e.g., 3*2+1 = 7 chunks
             
-            # Get neighboring chunks
+            # Try to center the window around current chunk
+            half_window = num_neighbors
+            start_index = chunk_index - half_window
+            end_index = chunk_index + half_window
+            
+            # Adjust window if it goes beyond boundaries
+            if start_index < 0:
+                # Shift window right if we're too close to start
+                adjustment = abs(start_index)
+                start_index = 0
+                end_index = min(total_chunks - 1, end_index + adjustment)
+            elif end_index >= total_chunks:
+                # Shift window left if we're too close to end
+                adjustment = end_index - (total_chunks - 1)
+                end_index = total_chunks - 1
+                start_index = max(0, start_index - adjustment)
+            
+            # Ensure we don't exceed total chunks
+            end_index = min(end_index, total_chunks - 1)
+            
+            print(f"DEBUG: Getting neighbors for chunk {chunk_index}/{total_chunks}, window: {start_index}-{end_index}")
+            
             neighbors = []
-            min_index = max(0, chunk_index - num_neighbors)
-            max_index = chunk_index + num_neighbors
             
-            # Scroll through results to find neighbors
-            offset = None
-            while True:
-                scroll_results, next_offset = self.qdrant_client.scroll(
-                    collection_name=self.config.collection_name,
-                    scroll_filter=doc_filter,
-                    limit=100,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=True
-                )
-                
-                if not scroll_results:
-                    break
-                
-                for point in scroll_results:
-                    current_index = point.payload.get("chunk_index")
-                    if current_index is not None and min_index <= current_index <= max_index:
-                        vector = point.vector if point.vector is not None else [0.0] * self.config.embedding_dim
-                        neighbors.append({
-                            "payload": point.payload,
-                            "vector": vector,
-                            "score": getattr(point, 'score', 0.0)
-                        })
-                
-                if next_offset is None:
-                    break
-                offset = next_offset
+            # Get chunks by document_id if available
+            if document_id:
+                try:
+                    doc_filter = Filter(must=[
+                        FieldCondition(key="document_id", match=MatchValue(value=document_id))
+                    ])
+                    
+                    offset = None
+                    while True:
+                        scroll_results, next_offset = self.qdrant_client.scroll(
+                            collection_name=self.config.collection_name,
+                            scroll_filter=doc_filter,
+                            limit=100,
+                            offset=offset,
+                            with_payload=True,
+                            with_vectors=True
+                        )
+                        
+                        if not scroll_results:
+                            break
+                        
+                        for point in scroll_results:
+                            current_index = point.payload.get("chunk_index")
+                            if current_index is not None and start_index <= current_index <= end_index:
+                                vector = point.vector if point.vector is not None else [0.0] * self.config.embedding_dim
+                                neighbors.append({
+                                    "payload": point.payload,
+                                    "vector": vector,
+                                    "score": getattr(point, 'score', 0.0)
+                                })
+                        
+                        if next_offset is None:
+                            break
+                        offset = next_offset
+                        
+                except Exception as e:
+                    print(f"Error with document_id filter: {e}")
+                    return []
+            else:
+                # No document_id available, skip neighboring chunks
+                return []
             
-            # Sort by chunk index
+            # Sort by chunk index to maintain document order
             neighbors.sort(key=lambda x: x["payload"].get("chunk_index", 0))
+            
+            print(f"DEBUG: Found {len(neighbors)} neighboring chunks with indices: {[n['payload'].get('chunk_index') for n in neighbors]}")
             return neighbors
             
         except Exception as e:
