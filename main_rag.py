@@ -9,8 +9,8 @@ from dataclasses import dataclass
 @dataclass
 class RAGConfig:
     """Configuration for RAG service"""
-    qdrant_url: str = os.getenv("QDRANT_URL")
-    qdrant_api_key: str = os.getenv("QDRANT_API_KEY")
+    qdrant_url: str = os.getenv("QDRANT_URL", "https://49092692-7b8a-45c2-913d-8646052b153a.us-east-1-0.aws.cloud.qdrant.io:6333")
+    qdrant_api_key: str = os.getenv("QDRANT_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.VSGH6CWTDouDMyixtGN8onleYf7LJ4cO0pPAdz-YcUA")
     collection_name: str = os.getenv("COLLECTION_NAME", "documents")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "dengcao/Qwen3-Embedding-0.6B:F16")
     embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "1024"))
@@ -362,7 +362,7 @@ class VectorRAGService:
                 })
             
             return {
-                "collection_name": info.name,
+                "collection_name": self.config.collection_name,
                 "total_points": info.points_count,
                 "vectors_count": info.vectors_count,
                 "sample_documents": sample_docs,
