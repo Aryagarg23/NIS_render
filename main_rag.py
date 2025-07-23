@@ -1,27 +1,4 @@
-async def _get_neighboring_chunks(self, payload: Dict, num_neighbors: int = 3) -> List[Dict]:
-        """Get neighboring chunks based on file and position"""
-        try:
-            source_file = payload.get("source_file_name")
-            page_number = payload.get("page_number")
-            chunk_index = payload.get("chunk_index")
-            
-            if not all([source_file, chunk_index is not None]):
-                return []
-            
-            # For files without page numbers, use chunk_index based filtering
-            if page_number is None:
-                # Simple approach: get chunks with similar indices from same file
-                return await self._get_neighbors_by_index(source_file, chunk_index, num_neighbors)
-            
-            # Create filter for same document and page
-            doc_filter = Filter(must=[
-                FieldCondition(key="source_file_name", match=MatchValue(value=source_file)),
-                FieldCondition(key="page_number", match=MatchValue(value=page_number))
-            ])
-            
-            # Get neighboring chunks
-            neighbors = []
-            min_index = max(0, chunk_import numpy as np
+import numpy as np
 from typing import List, Dict, Optional, Tuple
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, SearchRequest
@@ -32,8 +9,8 @@ from dataclasses import dataclass
 @dataclass
 class RAGConfig:
     """Configuration for RAG service"""
-    qdrant_url: str = os.getenv("QDRANT_URL", "ds:6333")
-    qdrant_api_key: str = os.getenv("QDRANT_API_KEY", "dsa8onleYf7LJ4cO0pPAdz-YcUA")
+    qdrant_url: str = os.getenv("QDRANT_URL")
+    qdrant_api_key: str = os.getenv("QDRANT_API_KEY")
     collection_name: str = os.getenv("COLLECTION_NAME", "documents")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "dengcao/Qwen3-Embedding-0.6B:F16")
     embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "1024"))
@@ -202,16 +179,14 @@ class VectorRAGService:
     async def _get_neighboring_chunks(self, payload: Dict, num_neighbors: int = 3) -> List[Dict]:
         """Get neighboring chunks using sliding window with minimum chunk count"""
         try:
-            source_file = payload.get("source_file_name")
+            document_id = payload.get("document_id")
             chunk_index = payload.get("chunk_index")
             total_chunks = payload.get("total_chunks")
-            document_id = payload.get("document_id")
             
-            if not all([source_file, chunk_index is not None, total_chunks is not None]):
+            if not all([document_id, chunk_index is not None, total_chunks is not None]):
                 return []
             
             # Calculate sliding window to get minimum number of chunks
-            # We want (num_neighbors * 2 + 1) total chunks with current chunk ideally in center
             window_size = num_neighbors * 2 + 1  # e.g., 3*2+1 = 7 chunks
             
             # Try to center the window around current chunk
@@ -238,18 +213,49 @@ class VectorRAGService:
             
             neighbors = []
             
-            # Get chunks by document_id if available
-            if document_id:
-                try:
-                    doc_filter = Filter(must=[
-                        FieldCondition(key="document_id", match=MatchValue(value=document_id))
-                    ])
+            # Use document_id filter instead of source_file_name
+            try:
+                doc_filter = Filter(must=[
+                    FieldCondition(key="document_id", match=MatchValue(value=document_id))
+                ])
+                
+                offset = None
+                while True:
+                    scroll_results, next_offset = self.qdrant_client.scroll(
+                        collection_name=self.config.collection_name,
+                        scroll_filter=doc_filter,
+                        limit=100,
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=True
+                    )
                     
+                    if not scroll_results:
+                        break
+                    
+                    for point in scroll_results:
+                        current_index = point.payload.get("chunk_index")
+                        if current_index is not None and start_index <= current_index <= end_index:
+                            vector = point.vector if point.vector is not None else [0.0] * self.config.embedding_dim
+                            neighbors.append({
+                                "payload": point.payload,
+                                "vector": vector,
+                                "score": getattr(point, 'score', 0.0)
+                            })
+                    
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+                    
+            except Exception as e:
+                print(f"Error with document_id filter: {e}")
+                # If document_id filtering fails, try without filtering and match manually
+                try:
+                    print("Falling back to manual filtering...")
                     offset = None
                     while True:
                         scroll_results, next_offset = self.qdrant_client.scroll(
                             collection_name=self.config.collection_name,
-                            scroll_filter=doc_filter,
                             limit=100,
                             offset=offset,
                             with_payload=True,
@@ -260,8 +266,11 @@ class VectorRAGService:
                             break
                         
                         for point in scroll_results:
-                            current_index = point.payload.get("chunk_index")
-                            if current_index is not None and start_index <= current_index <= end_index:
+                            # Manual filtering by document_id and chunk_index
+                            if (point.payload.get("document_id") == document_id and
+                                point.payload.get("chunk_index") is not None and
+                                start_index <= point.payload.get("chunk_index") <= end_index):
+                                
                                 vector = point.vector if point.vector is not None else [0.0] * self.config.embedding_dim
                                 neighbors.append({
                                     "payload": point.payload,
@@ -269,16 +278,13 @@ class VectorRAGService:
                                     "score": getattr(point, 'score', 0.0)
                                 })
                         
-                        if next_offset is None:
+                        if next_offset is None or len(neighbors) >= window_size:
                             break
                         offset = next_offset
                         
-                except Exception as e:
-                    print(f"Error with document_id filter: {e}")
+                except Exception as e2:
+                    print(f"Manual filtering also failed: {e2}")
                     return []
-            else:
-                # No document_id available, skip neighboring chunks
-                return []
             
             # Sort by chunk index to maintain document order
             neighbors.sort(key=lambda x: x["payload"].get("chunk_index", 0))
